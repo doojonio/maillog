@@ -1,0 +1,241 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite -signatures, -async_await;
+use Mojolicious::Commands;
+use Mojo::Pg;
+
+get '/' => sub ($c) {
+  $c->render(template => 'index');
+};
+
+get '/search' => sub ($c) {
+  my $address = $c->param('address');
+
+  if (!$address) {
+    return $c->render(json => {error => "Missing address parameter"}, status => 400);
+  }
+
+
+  # FIXME: message table needs an address column
+  my $rows = $c->db->query(
+    '
+      (
+        SELECT int_id, created, str FROM message
+        WHERE message.str LIKE (?)
+      )
+      UNION ALL
+      (
+        SELECT int_id, created, str FROM log
+        WHERE log.address = (?)
+      )
+
+      ORDER BY int_id, created
+      LIMIT 101
+    ', "% $address %", $address
+  )->arrays;
+
+  my $exceeded = 0;
+  if (@$rows > 100) {
+    pop(@$rows);
+    $exceeded = 1;
+  }
+
+  $c->render(template => 'search', rows => $rows, exceeded => $exceeded)
+};
+
+helper 'pg' => sub ($c) {
+  state $pg = Mojo::Pg->new(sprintf('postgresql://%s:%s@%s:%s/%s', @ENV{qw(DB_USER DB_PASSWORD DB_HOST DB_PORT DB_NAME)}))
+};
+
+helper 'db' => sub ($c) {
+  $c->pg->db
+};
+
+
+package MailLog::Command::migrate {
+  use Mojo::Base qw(Mojolicious::Command), -signatures;
+
+  has description => 'Migrate database to latest scheme';
+
+  sub run ($c) {
+    $c->app->pg->migrations->from_string(<<EOF)->migrate();
+      -- 1 up
+      CREATE TABLE message (
+        created TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL,
+        id VARCHAR NOT NULL,
+        int_id CHAR(16) NOT NULL,
+        str VARCHAR NOT NULL,
+        status BOOL,
+
+        CONSTRAINT message_id_pk PRIMARY KEY(id)
+      );
+      CREATE INDEX message_created_idx ON message (created);
+      CREATE INDEX message_int_id_idx ON message (int_id);
+
+      CREATE TABLE log (
+        created TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL,
+        int_id CHAR(16) NOT NULL,
+        str VARCHAR,
+        address VARCHAR
+      );
+      CREATE INDEX log_address_idx ON log USING hash (address);
+      -- 1 down
+      DROP TABLE log;
+      DROP TABLE message;
+EOF
+  }
+}
+package MailLog::Command::parse {
+  use Mojo::Base qw(Mojolicious::Command), -signatures;
+
+  use experimental qw(try);
+
+  use Mojo::File ();
+  use List::Util qw(any);
+
+  use constant {
+    FLAG_INCOME      => '<=',
+    FLAG_SENT        => '=>',
+    FLAG_SENT_CC     => '->',
+    FLAG_SENT_FAILED => '**',
+    FLAG_SENT_DELAY  => '==',
+  };
+
+  use constant FLAGS => (
+    FLAG_INCOME,
+    FLAG_SENT,
+    FLAG_SENT_CC,
+    FLAG_SENT_FAILED,
+    FLAG_SENT_DELAY,
+  );
+
+  has description => 'Parse mail log and insert results into database';
+
+  sub run ($c, $filename = "./data/out") {
+
+    my $file = Mojo::File->new($filename);
+    my $handle = $file->open();
+
+    while (my $line = <$handle>) {
+      my ($date, $time, $int_id, $rest) = split(/ /, $line, 4);
+
+      my ($flag, $address, $info);
+      if ($c->_is_msg_log($rest)) {
+        ($flag, $address, $info) = $c->_extract_msg_parts($rest);
+      } else {
+        $info = $rest;
+      }
+
+      my $ts = join(' ', $date, $time);
+      my $str = join(' ', $int_id, $rest);
+
+      if (($flag // '') eq FLAG_INCOME) {
+        $c->_add_message($ts, $int_id, $str, $info);
+      } else {
+        $c->_add_log($ts, $int_id, $str, $address);
+      }
+    }
+
+    sub _is_msg_log($c, $rest) {
+      my($flag_part, $address, $rest_) = split(/ /, $rest, 2);
+      return unless length($flag_part) == 2;
+      return unless length($address);
+      return any { $flag_part eq $_  } FLAGS;
+    }
+
+    sub _extract_msg_parts($c, $info) {
+      return split(/ /, $info, 3);
+    }
+
+    sub _extract_id($c, $info) {
+      return $1 if $info =~ /(?<!\S)id=(\S+)/;
+      return undef;
+    }
+
+    sub _add_message ($c, $ts, $int_id, $str, $info) {
+      my $id = $c->_extract_id($info);
+
+      if (!defined($id)) {
+        warn "Missing id in $ts $str";
+        return;
+      }
+
+      try {
+        $c->app->pg->db->insert('message', {
+          created => $ts,
+          id      => $c->_extract_id($info),
+          int_id  => $int_id,
+          str     => $str,
+        });
+      }
+      catch ($e) {
+        warn "Failed to insert $ts $str ($e)";
+      }
+    }
+
+    sub _add_log ($c, $ts, $int_id, $str, $address) {
+      try {
+        $c->app->pg->db->insert('log', {
+          created => $ts,
+          int_id  => $int_id,
+          str     => $str,
+          address => $address,
+        });
+      }
+      catch ($e) {
+        warn "Failed to insert $ts $str ($e)";
+      }
+    }
+
+  }
+}
+push(app->commands->namespaces->@*, 'MailLog::Command');
+
+app->start;
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'Mail Log';
+
+@@ search.html.ep
+% layout 'default';
+% title 'Search';
+
+<table border="1">
+  <tr>
+    <th>Timestamp</th>
+    <th>Log</th>
+  </tr>
+  % for my $row (@$rows) {
+  <tr>
+    <td>
+      %= $row->[1]
+    </td>
+    <td>
+      %= $row->[2]
+    </td>
+  </tr>
+  % }
+</table>
+
+% if ($exceeded) {
+<p>Limit exceeded</p>
+% }
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html>
+  <head>
+    <title><%= title %></title>
+  </head>
+  <body>
+    <h1>Mail Log</h1>
+    <form action="/search" method="get">
+      <input type="text" name="address" />
+      <button type="submit">Search</button>
+    </form>
+
+    <%= content %>
+
+  </body>
+</html>

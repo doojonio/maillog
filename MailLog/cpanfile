@@ -1,0 +1,7 @@
+requires 'Mojolicious';
+requires 'Mojo::Pg';
+requires 'Future::AsyncAwait';
+
+on 'develop' => sub {
+  recommends 'DDP';
+};
